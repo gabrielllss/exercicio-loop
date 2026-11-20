@@ -47,25 +47,32 @@ def do_request(session: requests.Session, token: str, max_iterations: int | None
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    # Na primeira requisição enviamos maxIterations.
-    # Nas seguintes, repetimos o mesmo body (a API ignora após o START).
-    payload = {"maxIterations": max_iterations} if max_iterations else {}
+    # A API exige maxIterations em TODAS as requisições.
+    # Sempre enviamos o mesmo valor do ciclo.
+    effective_max = max_iterations if max_iterations else 10
+    payload = {"maxIterations": effective_max}
     started = time.monotonic()
-    resp = session.request("POST", API_URL, headers=headers, json=payload or None, timeout=REQUEST_TIMEOUT)
+    resp = session.request("POST", API_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
     elapsed = time.monotonic() - started
     log.debug(f"HTTP {resp.status_code} em {elapsed:.2f}s | body={resp.text[:500]}")
+    # A API retorna 400 com JSON para TOO_EARLY / TOO_LATE — tratar como resposta válida
+    try:
+        data = resp.json()
+    except ValueError:
+        resp.raise_for_status()
+        raise RuntimeError(f"Resposta não-JSON da API: {resp.text[:500]}")
+    # Se tem status de desafio, retorna mesmo com 400 (TOO_EARLY/TOO_LATE)
+    if isinstance(data, dict) and str(data.get("status", "")).upper() in ("START", "CONTINUE", "SUCCESS", "TOO_EARLY", "TOO_LATE"):
+        if resp.status_code >= 400:
+            log.warning(f"HTTP {resp.status_code} com status de desafio: {data}")
+        return data
+    # Erro real (ex: campo inválido)
     try:
         resp.raise_for_status()
     except requests.HTTPError:
-        # Tenta extrair JSON de erro da API antes de estourar
-        try:
-            log.error(f"Erro HTTP: {resp.text[:1000]}")
-        finally:
-            raise
-    try:
-        return resp.json()
-    except ValueError:
-        raise RuntimeError(f"Resposta não-JSON da API: {resp.text[:500]}")
+        log.error(f"Erro HTTP: {resp.text[:1000]}")
+        raise
+    return data
 
 
 def precise_sleep(seconds: float, log: logging.Logger) -> None:
@@ -99,7 +106,7 @@ def run_challenge(token: str, max_iterations: int, buffer: float, log: logging.L
     while True:
         attempt += 1
         try:
-            data = do_request(session, token, max_iterations if attempt == 1 else None, log)
+            data = do_request(session, token, max_iterations, log)
         except (requests.ConnectionError, requests.Timeout) as e:
             log.warning(f"Falha de rede (tentativa {attempt}): {e}. Tentando de novo em 3s...")
             time.sleep(3)
@@ -140,7 +147,7 @@ def run_challenge(token: str, max_iterations: int, buffer: float, log: logging.L
             while True:
                 attempt += 1
                 try:
-                    data = do_request(session, token, None, log)
+                    data = do_request(session, token, max_iterations, log)
                 except (requests.ConnectionError, requests.Timeout) as e:
                     log.warning(f"Falha de rede: {e}. Nova tentativa em 3s...")
                     time.sleep(3)
